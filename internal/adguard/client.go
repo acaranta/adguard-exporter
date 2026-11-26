@@ -1,15 +1,16 @@
 package adguard
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/csfreak/adguard-exporter/internal/metrics"
@@ -17,12 +18,12 @@ import (
 )
 
 var (
-	port                  uint16
-	statusURLPattern      = "%s://%s:%d/control/status"
-	statsURLPattern       = "%s://%s:%d/control/stats"
-	logstatsURLPattern    = "%s://%s:%d/control/querylog?limit=%s&response_status=\"all\""
-	resolveRDNSURLPattern = "%s://%s:%d/control/clients/find?%s"
-	m                     map[string]int
+	port                 uint16
+	statusURLPattern     = "%s://%s:%d/control/status"
+	statsURLPattern      = "%s://%s:%d/control/stats"
+	logstatsURLPattern   = "%s://%s:%d/control/querylog?limit=%s"
+	searchClientsPattern = "%s://%s:%d/control/clients/search"
+	m                    map[string]int
 )
 
 // Client struct is a AdGuard  client to request an instance of a AdGuard  ad blocker.
@@ -41,7 +42,7 @@ type Client struct {
 // NewClient method initializes a new AdGuard  client.
 func NewClient(protocol, hostname, username, password, adport string, interval time.Duration, logLimit string, rdnsenabled bool, insecuretls bool) *Client {
 
-	temp, err := strconv.ParseInt(adport, 10, 16)
+	temp, err := strconv.ParseUint(adport, 10, 16)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -197,44 +198,79 @@ func (c *Client) getStatistics() *AllStats {
 	allstats.logStats = &logstats
 
 	if c.rdnsenabled {
-		var sb strings.Builder
+		var ips []string
 		for l := range stats.TopClients {
-			for source, _ := range stats.TopClients[l] {
-				sb.WriteString(fmt.Sprintf("ip%d=%s", l, source))
-				if l < len(stats.TopClients)-1 {
-					sb.WriteString("&")
-				}
+			for source := range stats.TopClients[l] {
+				ips = append(ips, source)
 			}
 		}
-		rdnsURL := fmt.Sprintf(resolveRDNSURLPattern, c.protocol, c.hostname, c.port, sb.String())
-		body = c.MakeRequest(rdnsURL)
-		var results []map[string]interface{}
-		err = json.Unmarshal(body, &results)
-		if err != nil {
-			log.Println("Unable to unmarshal Reverse DNS", err)
-		}
-
-		rdnsData := make(map[string]string)
-		for _, result := range results {
-			for key := range result {
-				data := result[key].(map[string]interface{})
-				rdnsData[key] = data["name"].(string)
-			}
-		}
-		allstats.rdns = rdnsData
+		allstats.rdns = c.resolveRDNS(ips)
 	}
 
 	return &allstats
 }
 
+// resolveRDNS maps client IPs to the names AdGuard Home knows for them.
+// It uses POST /control/clients/search, which replaced GET /control/clients/find
+// (deprecated in v0.107.56, removed in v1.0.0). IPs without a name are left
+// out so that callers fall back to the IP itself.
+func (c *Client) resolveRDNS(ips []string) map[string]string {
+	rdnsData := make(map[string]string)
+	if len(ips) == 0 {
+		return rdnsData
+	}
+
+	type searchItem struct {
+		ID string `json:"id"`
+	}
+	var search struct {
+		Clients []searchItem `json:"clients"`
+	}
+	for _, ip := range ips {
+		search.Clients = append(search.Clients, searchItem{ID: ip})
+	}
+	payload, err := json.Marshal(search)
+	if err != nil {
+		log.Println("Unable to marshal client search request", err)
+		return rdnsData
+	}
+
+	searchURL := fmt.Sprintf(searchClientsPattern, c.protocol, c.hostname, c.port)
+	body := c.doRequest(http.MethodPost, searchURL, bytes.NewReader(payload))
+
+	// Response: [{"<ip>": {"name": "...", ...}}, ...]
+	var results []map[string]struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &results); err != nil {
+		log.Println("Unable to unmarshal Reverse DNS", err)
+		return rdnsData
+	}
+	for _, result := range results {
+		for ip, data := range result {
+			if data.Name != "" {
+				rdnsData[ip] = data.Name
+			}
+		}
+	}
+	return rdnsData
+}
+
 func (c *Client) MakeRequest(url string) []byte {
-	req, err := http.NewRequest("GET", url, nil)
+	return c.doRequest(http.MethodGet, url, nil)
+}
+
+func (c *Client) doRequest(method, url string, payload io.Reader) []byte {
+	req, err := http.NewRequest(method, url, payload)
 	if err != nil {
 		log.Fatal("An error has occurred when creating HTTP statistics request", err)
 	}
 
 	req.Host = c.hostname
 	req.Header.Add("User-Agent", "Mozilla/5.0")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	if c.isUsingPassword() {
 		c.authenticateRequest(req)
